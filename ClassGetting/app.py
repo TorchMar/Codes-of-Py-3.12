@@ -104,7 +104,93 @@ class App:
         print(keyword)
         self.keyword = keyword
         self.fetch_search_results()
+        
+    def get_selected_class_of_same_course(self, course: SelectionClass):
+        """
+        检查当前课表中是否已选同一课程的其他班级
+        返回已选班级对象，否则返回 None
+        """
+        # 获取当前学年和学期（请根据实际情况传参）
+        year = 2025
+        semester = 0
+        try:
+            schedule = self.cli.schedule(year, semester)
+        except Exception as e:
+            print("获取课表失败：", e)
+            return None
 
+        for klass in schedule:
+            # pysjtu 的 schedule 返回的对象字段名可能和 SelectionClass 不完全一致，请根据实际字段名调整
+            if hasattr(klass, "name") and hasattr(klass, "class_id"):
+                if klass.name == course.name and klass.class_id != course.class_name:
+                    return klass
+        return None
+    
+    class SwitchClassDaemon(QThread):
+        signal = pyqtSignal(SelectionClass)
+
+        def __init__(self, old_class: SelectionClass, new_class: SelectionClass, app_ref):
+            super().__init__()
+            self.old_class = old_class
+            self.new_class = new_class
+            self.app_ref = app_ref
+
+        def run(self):
+            while True:
+                time.sleep(1)
+                try:
+                    year = 2025
+                    semester = 0
+                    try:
+                        schedule = self.app_ref.cli.schedule(year, semester)
+                        # 判断是否还选着 old_class
+                        has_old = any(
+                            hasattr(k, "course_id") and hasattr(k, "class_id") and
+                            k.course_id == self.old_class.course_id and k.class_id == self.old_class.class_id
+                            for k in schedule
+                        )
+                        # sector.classes 里找 SelectionClass 实例
+                        old_class = next((k for k in self.app_ref.sector.classes
+                                          if k.class_id == self.old_class.class_id), self.old_class)
+                        new_class = next((k for k in self.app_ref.sector.classes
+                                          if k.class_id == self.new_class.class_id), self.new_class)
+                    except Exception as e:
+                        print("刷新课表失败：", e)
+                        old_class = self.old_class
+                        new_class = self.new_class
+                        has_old = True  # 保守处理
+
+                    if new_class.students_registered < new_class.students_planned:
+                        print(f"{new_class.name} {new_class.class_name} 有余量，尝试切换")
+                        # 只有还选着 old_class 时才退课
+                        if has_old:
+                            try:
+                                old_class.drop()
+                                print("退课成功")
+                            except Exception as e:
+                                print("退课失败", e)
+                                time.sleep(1)
+                                continue
+                            time.sleep(1)  # 退课后等一会再选新班级
+                        try:
+                            new_class.register()
+                            print("切换成功")
+                            break
+                        except Exception as e:
+                            print("切换失败，尝试恢复原班级", e)
+                            # 恢复原班级
+                            try:
+                                old_class.register()
+                                print("恢复原班级成功")
+                            except Exception as e2:
+                                print("恢复原班级失败", e2)
+                            time.sleep(1)
+                    else:
+                        print(f"{new_class.name} {new_class.class_name} 仍无余量，继续监听")
+                except Exception as e:
+                    print("监听或切换时异常", e)
+            self.signal.emit(self.new_class)
+        
     class SelectDaemon(QThread):
         signal = pyqtSignal(SelectionClass)
 
@@ -128,12 +214,27 @@ class App:
             print(f"{self.course.name} 的抢课守护线程退出")
             self.signal.emit(self.course)
 
+    #def on_select_course(self, course: SelectionClass):
+    #    daemon = App.SelectDaemon(course)
+    #    daemon.signal.connect(self.selection_window.finish_select)
+    #    self.daemon_map[course.name] = daemon
+    #    daemon.start()
     def on_select_course(self, course: SelectionClass):
-        daemon = App.SelectDaemon(course)
-        daemon.signal.connect(self.selection_window.finish_select)
-        self.daemon_map[course.name] = daemon
-        daemon.start()
-
+        old_class = self.get_selected_class_of_same_course(course)
+        if old_class is None:
+            # 直接抢课
+            daemon = App.SelectDaemon(course)
+            daemon.signal.connect(self.selection_window.finish_select)
+            self.daemon_map[course.name] = daemon
+            daemon.start()
+        else:
+            # 切换班级守护线程
+            switch_daemon = App.SwitchClassDaemon(old_class, course, self)
+            switch_daemon.signal.connect(self.selection_window.finish_select)
+            key = f"{course.name}-{course.class_id}-switch"
+            self.daemon_map[key] = switch_daemon
+            switch_daemon.start()
+            
     def clear_selection(self):
         #self.selection_window.clear_selection() #清空已选课程列表
         #for course in self.daemon_map:     #终止抢课进程
@@ -141,7 +242,12 @@ class App:
         pass
 
     def on_remove_course(self, course: SelectionClass):
-        self.daemon_map[course.name].quit()
+        key = f"{course.name}-{course.class_id}"
+        if key in self.daemon_map:
+            self.daemon_map[key].quit()
+            del self.daemon_map[key]
+        else:
+            print(f"未找到 key={key} 的抢课线程")
 
     def handle_selection(self):
         self.selection_window = CourseSelectionWindow()
